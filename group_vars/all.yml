@@ -1,0 +1,50 @@
+---
+minikube_profile: swim
+minikube_cpus: 6
+minikube_memory: 12288
+minikube_driver: podman
+
+cert_manager_version: v1.16.0
+
+operator_base_dir: "{{ playbook_dir }}/../swim-operator/swim-kubernetes-operator"
+swim_operator_manifest: "{{ operator_base_dir }}/dist/install.yaml"
+swim_pki_manifest: "{{ operator_base_dir }}/config/pki/swim-pki.yaml"
+keycloak_manifest: "{{ operator_base_dir }}/config/keycloak/keycloak.yaml"
+keycloak_realm_file: "{{ playbook_dir }}/../compose/keycloak/realm/swim-realm.json"
+samples_dir: "{{ playbook_dir }}/../compose/samples"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Image build options
+#
+# By default all images are pulled from quay.io (fast, no build required).
+# Set build_operator_image / build_app_images to true ONLY when:
+#   - The quay.io image is outdated or not yet published
+#   - You need to test local code changes before pushing
+#   - The Minikube VM arch does not match the published image arch
+#
+# When build_*: true the playbook:
+#   1. Detects the Minikube VM architecture automatically
+#   2. Builds the image for that arch (linux/arm64 or linux/amd64)
+#   3. Exports to /tmp/*.tar and loads directly into Minikube
+#
+# When build_*: false the Kubernetes pods pull from quay.io on first start.
+# ──────────────────────────────────────────────────────────────────────────────
+build_operator_image: false
+operator_image: "quay.io/masales/swim-kubernetes-operator:latest"
+
+build_app_images: false
+app_images_dir: "{{ playbook_dir }}/../swim-developer"
+consumer_image: "quay.io/masales/swim-dnotam-consumer:latest"
+provider_image: "quay.io/masales/swim-dnotam-provider:latest"
+
+deploy_samples: false
+cleanup: false
+restart: false
+install_prometheus: false
+
+ns_keycloak: keycloak
+ns_dnotam_consumervalidator: swim-external-provider
+ns_ed254_consumervalidator: swim-ed254-cv
+ns_dnotam_backend: swim-sandbox
+ns_ed254_backend: swim-ed254
+ns_providervalidator: swim-providervalidator

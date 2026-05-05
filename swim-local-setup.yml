@@ -1,0 +1,1003 @@
+---
+- name: SWIM Local Environment - Complete Setup (Minikube)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  tasks:
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAG: cleanup
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Cleanup - Delete minikube profile
+      ansible.builtin.command: minikube delete --profile={{ minikube_profile }}
+      when: cleanup
+      register: cleanup_result
+      failed_when: false
+      tags: [cleanup]
+
+    - name: Cleanup - Display result
+      ansible.builtin.debug:
+        msg: "Cleanup complete. Minikube profile '{{ minikube_profile }}' deleted."
+      when: cleanup
+      tags: [cleanup]
+
+    - name: Exit after cleanup
+      ansible.builtin.meta: end_play
+      when: cleanup
+      tags: [cleanup]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAG: restart
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Restart - Start existing minikube profile
+      ansible.builtin.command: minikube start --profile={{ minikube_profile }}
+      when: restart
+      tags: [restart]
+
+    - name: Restart - Set kubectl context
+      ansible.builtin.command: kubectl config use-context {{ minikube_profile }}
+      when: restart
+      tags: [restart]
+
+    - name: Restart - Display result
+      ansible.builtin.debug:
+        msg: "Environment restarted. Profile '{{ minikube_profile }}' is running."
+      when: restart
+      tags: [restart]
+
+    - name: Exit after restart
+      ansible.builtin.meta: end_play
+      when: restart
+      tags: [restart]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAG: minikube
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Check if minikube is installed
+      ansible.builtin.command: which minikube
+      register: minikube_check
+      changed_when: false
+      failed_when: false
+      tags: [minikube]
+
+    - name: Fail if minikube is not installed
+      ansible.builtin.fail:
+        msg: |
+          Minikube is not installed. Install it first:
+          - macOS: brew install minikube
+          - Linux: curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 && sudo install minikube-linux-amd64 /usr/local/bin/minikube
+      when: minikube_check.rc != 0
+      tags: [minikube]
+
+    - name: Check if kubectl is installed
+      ansible.builtin.command: which kubectl
+      register: kubectl_check
+      changed_when: false
+      failed_when: false
+      tags: [minikube]
+
+    - name: Get latest kubectl version
+      ansible.builtin.uri:
+        url: https://dl.k8s.io/release/stable.txt
+        return_content: true
+      register: kubectl_version
+      when: kubectl_check.rc != 0
+      tags: [minikube]
+
+    - name: Download and install kubectl
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/{{ kubectl_version.content | trim }}/bin/{{ 'darwin' if ansible_system == 'Darwin' else 'linux' }}/{{ 'arm64' if ansible_architecture == 'aarch64' or ansible_architecture == 'arm64' else 'amd64' }}/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+      become: true
+      when: kubectl_check.rc != 0
+      tags: [minikube]
+
+    - name: Delete existing minikube profile (clean start)
+      ansible.builtin.command: minikube delete --profile={{ minikube_profile }}
+      register: minikube_delete
+      failed_when: false
+      changed_when: minikube_delete.rc == 0
+      tags: [minikube]
+
+    - name: Create minikube profile
+      ansible.builtin.command: >
+        minikube start
+        --profile={{ minikube_profile }}
+        --cpus={{ minikube_cpus }}
+        --memory={{ minikube_memory }}
+        --addons=ingress
+        --driver={{ minikube_driver }}
+      tags: [minikube]
+
+    - name: Set kubectl context
+      ansible.builtin.command: kubectl config use-context {{ minikube_profile }}
+      changed_when: true
+      tags: [minikube]
+
+    - name: Wait for minikube node
+      ansible.builtin.command: kubectl get nodes
+      register: nodes_ready
+      until: nodes_ready.rc == 0
+      retries: 30
+      delay: 10
+      tags: [minikube]
+
+    - name: Wait for Ingress Controller to be ready
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=120s deployment/ingress-nginx-controller -n ingress-nginx
+      retries: 5
+      delay: 10
+      register: ingress_wait
+      until: ingress_wait.rc == 0
+      tags: [minikube]
+
+    - name: Change Ingress Controller to LoadBalancer for minikube tunnel compatibility
+      ansible.builtin.command: >
+        kubectl patch svc ingress-nginx-controller -n ingress-nginx -p '{"spec":{"type":"LoadBalancer"}}'
+      tags: [minikube]
+
+    - name: Enable SSL passthrough in Ingress Controller for Artemis mTLS
+      ansible.builtin.command: >
+        kubectl patch deployment ingress-nginx-controller -n ingress-nginx
+        --type='json'
+        -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-ssl-passthrough"}]'
+      register: ssl_passthrough_patch
+      failed_when: ssl_passthrough_patch.rc != 0 and 'already exists' not in ssl_passthrough_patch.stderr
+      tags: [minikube]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAG: dependencies
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Add Helm repository for cert-manager
+      ansible.builtin.command: helm repo add jetstack https://charts.jetstack.io
+      register: helm_repo_add
+      failed_when: helm_repo_add.rc != 0 and 'already exists' not in helm_repo_add.stderr
+      tags: [dependencies]
+
+    - name: Update Helm repositories
+      ansible.builtin.command: helm repo update
+      tags: [dependencies]
+
+    - name: Install cert-manager via Helm
+      ansible.builtin.command: >
+        helm upgrade --install cert-manager jetstack/cert-manager
+        --namespace cert-manager
+        --create-namespace
+        --version {{ cert_manager_version }}
+        --set crds.enabled=true
+        --set crds.keep=true
+      tags: [dependencies]
+
+    - name: Wait for cert-manager deployments
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=120s deployment/{{ item }} -n cert-manager
+      loop:
+        - cert-manager
+        - cert-manager-webhook
+        - cert-manager-cainjector
+      retries: 3
+      delay: 10
+      register: cm_wait
+      until: cm_wait.rc == 0
+      tags: [dependencies]
+
+    - name: Wait for cert-manager webhook pod
+      ansible.builtin.command: >
+        kubectl wait --for=condition=ready --timeout=120s pod -l app=webhook -n cert-manager
+      retries: 3
+      delay: 10
+      register: webhook_ready
+      until: webhook_ready.rc == 0
+      tags: [dependencies]
+
+    - name: Apply SWIM PKI (CA and Issuers)
+      ansible.builtin.command: kubectl apply -f {{ swim_pki_manifest }}
+      retries: 5
+      delay: 10
+      register: pki_result
+      until: pki_result.rc == 0
+      tags: [dependencies]
+
+    - name: Wait for SWIM CA Certificate
+      ansible.builtin.command: >
+        kubectl wait --for=condition=ready --timeout=120s certificate/swim-ca -n cert-manager
+      retries: 5
+      delay: 10
+      register: ca_ready
+      until: ca_ready.rc == 0
+      tags: [dependencies]
+
+    - name: Verify swim-ca-issuer ClusterIssuer
+      ansible.builtin.command: >
+        kubectl get clusterissuer swim-ca-issuer -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: issuer_status
+      retries: 10
+      delay: 5
+      until: issuer_status.stdout == "True"
+      tags: [dependencies]
+
+    - name: Export SWIM CA certificate
+      ansible.builtin.shell: |
+        kubectl get secret swim-ca-secret -n cert-manager -o jsonpath='{.data.ca\.crt}' | base64 -d > {{ playbook_dir }}/swim-ca.crt
+      args:
+        executable: /bin/bash
+      tags: [dependencies]
+
+    - name: Display SWIM CA location
+      ansible.builtin.debug:
+        msg: "SWIM CA exported to {{ playbook_dir }}/swim-ca.crt - Import this in browsers/clients for HTTPS trust"
+      tags: [dependencies]
+
+    - name: Create strimzi-system namespace
+      ansible.builtin.command: kubectl create namespace strimzi-system
+      register: strimzi_ns
+      failed_when: strimzi_ns.rc != 0 and 'already exists' not in strimzi_ns.stderr
+      tags: [dependencies]
+
+    - name: Install Strimzi Kafka Operator
+      ansible.builtin.shell: |
+        kubectl create -f 'https://strimzi.io/install/latest?namespace=strimzi-system' -n strimzi-system 2>/dev/null || \
+        kubectl apply -f 'https://strimzi.io/install/latest?namespace=strimzi-system' -n strimzi-system
+      args:
+        executable: /bin/bash
+      tags: [dependencies]
+
+    - name: Wait for Strimzi operator
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=180s deployment/strimzi-cluster-operator -n strimzi-system
+      retries: 3
+      delay: 10
+      register: strimzi_wait
+      until: strimzi_wait.rc == 0
+      tags: [dependencies]
+
+    - name: Configure Strimzi to watch all namespaces
+      ansible.builtin.shell: |
+        kubectl set env deployment/strimzi-cluster-operator STRIMZI_NAMESPACE='*' -n strimzi-system
+        kubectl -n strimzi-system create clusterrolebinding strimzi-cluster-operator-namespaced \
+          --clusterrole=strimzi-cluster-operator-namespaced \
+          --serviceaccount=strimzi-system:strimzi-cluster-operator 2>/dev/null || true
+        kubectl -n strimzi-system create clusterrolebinding strimzi-cluster-operator-watched \
+          --clusterrole=strimzi-cluster-operator-watched \
+          --serviceaccount=strimzi-system:strimzi-cluster-operator 2>/dev/null || true
+        kubectl -n strimzi-system create clusterrolebinding strimzi-cluster-operator-entity-operator-delegation \
+          --clusterrole=strimzi-entity-operator \
+          --serviceaccount=strimzi-system:strimzi-cluster-operator 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      tags: [dependencies]
+
+    - name: Wait for Strimzi operator restart
+      ansible.builtin.command: >
+        kubectl rollout status deployment/strimzi-cluster-operator -n strimzi-system --timeout=120s
+      tags: [dependencies]
+
+    - name: Create ArtemisCloud namespace
+      ansible.builtin.shell: >
+        kubectl create namespace activemq-artemis-operator --dry-run=client -o yaml | kubectl apply -f -
+      tags: [dependencies]
+
+    - name: Install ArtemisCloud CRDs
+      ansible.builtin.command: "kubectl apply -f {{ item }}"
+      loop:
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/crds/broker_activemqartemis_crd.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/crds/broker_activemqartemisaddress_crd.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/crds/broker_activemqartemisscaledown_crd.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/crds/broker_activemqartemissecurity_crd.yaml
+      tags: [dependencies]
+
+    - name: Install ArtemisCloud Operator RBAC and Deployment
+      ansible.builtin.command: "kubectl apply -n activemq-artemis-operator -f {{ item }}"
+      loop:
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/service_account.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/role.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/role_binding.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/election_role.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/election_role_binding.yaml
+        - https://raw.githubusercontent.com/artemiscloud/activemq-artemis-operator/main/deploy/operator.yaml
+      tags: [dependencies]
+
+    - name: Apply ArtemisCloud cluster-wide RBAC
+      ansible.builtin.command: kubectl apply -f {{ operator_base_dir }}/config/artemis/artemis-cluster-rbac.yaml
+      register: artemis_rbac
+      failed_when: false
+      tags: [dependencies]
+
+    - name: Create ArtemisCloud cluster-wide RBAC inline (fallback)
+      ansible.builtin.shell: |
+        kubectl apply -f - <<'EOF'
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: activemq-artemis-operator-cluster-role
+        rules:
+        - apiGroups: [""]
+          resources: ["pods","services","endpoints","persistentvolumeclaims","events","configmaps","secrets","serviceaccounts"]
+          verbs: ["*"]
+        - apiGroups: ["apps"]
+          resources: ["deployments","replicasets","statefulsets"]
+          verbs: ["*"]
+        - apiGroups: ["networking.k8s.io"]
+          resources: ["ingresses"]
+          verbs: ["*"]
+        - apiGroups: ["broker.amq.io"]
+          resources: ["*"]
+          verbs: ["*"]
+        - apiGroups: ["rbac.authorization.k8s.io"]
+          resources: ["roles","rolebindings"]
+          verbs: ["*"]
+        - apiGroups: ["coordination.k8s.io"]
+          resources: ["leases"]
+          verbs: ["*"]
+        - apiGroups: ["policy"]
+          resources: ["poddisruptionbudgets"]
+          verbs: ["*"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: activemq-artemis-operator-cluster-rolebinding
+        subjects:
+        - kind: ServiceAccount
+          name: activemq-artemis-controller-manager
+          namespace: activemq-artemis-operator
+        roleRef:
+          kind: ClusterRole
+          name: activemq-artemis-operator-cluster-role
+          apiGroup: rbac.authorization.k8s.io
+        EOF
+      args:
+        executable: /bin/bash
+      when: artemis_rbac.rc != 0
+      tags: [dependencies]
+
+    - name: Patch ArtemisCloud Operator to watch all namespaces
+      ansible.builtin.command: >
+        kubectl set env deployment/activemq-artemis-controller-manager
+        -n activemq-artemis-operator
+        WATCH_NAMESPACE='*'
+      tags: [dependencies]
+
+    - name: Wait for ArtemisCloud operator
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=180s
+        deployment/activemq-artemis-controller-manager -n activemq-artemis-operator
+      retries: 5
+      delay: 15
+      register: artemis_wait
+      until: artemis_wait.rc == 0
+      tags: [dependencies]
+
+    - name: Install Prometheus Operator (optional)
+      ansible.builtin.command: >
+        kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/bundle.yaml
+      retries: 3
+      delay: 10
+      register: prometheus_crds
+      until: prometheus_crds.rc == 0
+      when: install_prometheus
+      tags: [dependencies]
+
+    - name: Wait for Prometheus Operator
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=180s deployment/prometheus-operator -n default
+      retries: 3
+      delay: 10
+      register: prometheus_wait
+      until: prometheus_wait.rc == 0
+      failed_when: false
+      when: install_prometheus
+      tags: [dependencies]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAG: operator
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Detect Minikube VM architecture
+      ansible.builtin.command: minikube --profile={{ minikube_profile }} ssh -- uname -m
+      register: minikube_arch_result
+      changed_when: false
+      when: build_operator_image or build_app_images
+      tags: [operator]
+
+    - name: Set image build platform
+      ansible.builtin.set_fact:
+        image_platform: "{{ 'linux/arm64' if minikube_arch_result.stdout | trim in ['aarch64', 'arm64'] else 'linux/amd64' }}"
+      when: build_operator_image or build_app_images
+      tags: [operator]
+
+    - name: Display detected image platform
+      ansible.builtin.debug:
+        msg: "Minikube VM arch: {{ minikube_arch_result.stdout | trim }} → building images for {{ image_platform }}"
+      when: build_operator_image or build_app_images
+      tags: [operator]
+
+    - name: Build SWIM Operator image locally
+      ansible.builtin.command: >
+        make image-build IMG={{ operator_image }}
+        IMAGE_PLATFORM={{ image_platform }}
+      args:
+        chdir: "{{ operator_base_dir }}"
+      when: build_operator_image
+      tags: [operator]
+
+    - name: Export SWIM Operator image to tar
+      ansible.builtin.command: podman save {{ operator_image }} -o /tmp/swim-operator.tar
+      when: build_operator_image
+      tags: [operator]
+
+    - name: Load SWIM Operator image into Minikube
+      ansible.builtin.command: minikube --profile={{ minikube_profile }} image load /tmp/swim-operator.tar
+      when: build_operator_image
+      tags: [operator]
+
+    - name: Tag SWIM Operator image in Minikube (local build)
+      ansible.builtin.command: >
+        minikube --profile={{ minikube_profile }} ssh "docker tag localhost/{{ operator_image }} {{ operator_image }}"
+      when: build_operator_image
+      failed_when: false
+      tags: [operator]
+
+    - name: Pull SWIM Operator image from registry into Minikube
+      ansible.builtin.command: >
+        minikube --profile={{ minikube_profile }} image pull {{ operator_image }}
+      when: not build_operator_image
+      tags: [operator]
+
+    - name: Install SWIM Kubernetes Operator
+      ansible.builtin.command: kubectl apply -f {{ swim_operator_manifest }}
+      tags: [operator]
+
+    - name: Patch SWIM Operator imagePullPolicy (local build only)
+      ansible.builtin.command: >
+        kubectl patch deployment swim-kubernetes-operator-controller-manager
+        -n swim-kubernetes-operator-system
+        -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"IfNotPresent"}]}}}}'
+      when: build_operator_image
+      tags: [operator]
+
+    - name: Wait for SWIM operator
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=120s
+        deployment/swim-kubernetes-operator-controller-manager -n swim-kubernetes-operator-system
+      retries: 3
+      delay: 10
+      register: swim_wait
+      until: swim_wait.rc == 0
+      tags: [operator]
+
+    - name: Maven build - DNOTAM Consumer and Provider
+      ansible.builtin.command: >
+        ./mvnw clean package -DskipTests -q
+        -pl swim-dnotam-consumer,swim-dnotam-provider -am
+      args:
+        chdir: "{{ app_images_dir }}"
+      when: build_app_images
+      tags: [operator]
+
+    - name: Build DNOTAM Consumer image ({{ image_platform }})
+      ansible.builtin.command: >
+        podman build --platform {{ image_platform }}
+        -f swim-dnotam-consumer/src/main/docker/Containerfile.jvm
+        -t {{ consumer_image }}
+        swim-dnotam-consumer/
+      args:
+        chdir: "{{ app_images_dir }}"
+      when: build_app_images
+      tags: [operator]
+
+    - name: Export DNOTAM Consumer image to tar
+      ansible.builtin.command: podman save {{ consumer_image }} -o /tmp/swim-dnotam-consumer.tar
+      when: build_app_images
+      tags: [operator]
+
+    - name: Load DNOTAM Consumer image into Minikube
+      ansible.builtin.command: minikube --profile={{ minikube_profile }} image load /tmp/swim-dnotam-consumer.tar
+      when: build_app_images
+      tags: [operator]
+
+    - name: Patch DNOTAM Consumer imagePullPolicy (local build)
+      ansible.builtin.shell: |
+        kubectl get deployment -l app=dnotam-consumer --all-namespaces -o json 2>/dev/null | \
+        jq -r '.items[] | .metadata.namespace + "/" + .metadata.name' | \
+        while IFS=/ read -r ns name; do
+          kubectl patch deployment "$name" -n "$ns" \
+            -p '{"spec":{"template":{"spec":{"containers":[{"name":"dnotam-consumer","imagePullPolicy":"IfNotPresent"}]}}}}' 2>/dev/null || true
+        done
+      args:
+        executable: /bin/bash
+      when: build_app_images
+      failed_when: false
+      tags: [operator]
+
+    - name: Build DNOTAM Provider image ({{ image_platform }})
+      ansible.builtin.command: >
+        podman build --platform {{ image_platform }}
+        -f swim-dnotam-provider/src/main/docker/Containerfile.jvm
+        -t {{ provider_image }}
+        swim-dnotam-provider/
+      args:
+        chdir: "{{ app_images_dir }}"
+      when: build_app_images
+      tags: [operator]
+
+    - name: Export DNOTAM Provider image to tar
+      ansible.builtin.command: podman save {{ provider_image }} -o /tmp/swim-dnotam-provider.tar
+      when: build_app_images
+      tags: [operator]
+
+    - name: Load DNOTAM Provider image into Minikube
+      ansible.builtin.command: minikube --profile={{ minikube_profile }} image load /tmp/swim-dnotam-provider.tar
+      when: build_app_images
+      tags: [operator]
+
+    - name: Patch DNOTAM Provider imagePullPolicy (local build)
+      ansible.builtin.shell: |
+        kubectl get deployment -l app=dnotam-provider --all-namespaces -o json 2>/dev/null | \
+        jq -r '.items[] | .metadata.namespace + "/" + .metadata.name' | \
+        while IFS=/ read -r ns name; do
+          kubectl patch deployment "$name" -n "$ns" \
+            -p '{"spec":{"template":{"spec":{"containers":[{"name":"dnotam-provider","imagePullPolicy":"IfNotPresent"}]}}}}' 2>/dev/null || true
+        done
+      args:
+        executable: /bin/bash
+      when: build_app_images
+      failed_when: false
+      tags: [operator]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Keycloak
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Get Minikube IP
+      ansible.builtin.command: minikube ip --profile={{ minikube_profile }}
+      register: minikube_ip_result
+      changed_when: false
+      tags: [operator, samples]
+
+    - name: Set dynamic hostnames
+      ansible.builtin.set_fact:
+        minikube_ip: "{{ minikube_ip_result.stdout | trim }}"
+        keycloak_host: "keycloak.{{ minikube_ip_result.stdout | trim }}.nip.io"
+        dnotam_provider_host: "swim-dnotam-provider.{{ minikube_ip_result.stdout | trim }}.nip.io"
+        ed254_provider_host: "swim-ed254-provider.{{ minikube_ip_result.stdout | trim }}.nip.io"
+        providervalidator_host: "swim-providervalidator.{{ minikube_ip_result.stdout | trim }}.nip.io"
+      tags: [operator, samples]
+
+    - name: Display dynamic hostnames
+      ansible.builtin.debug:
+        msg: |
+          Minikube IP: {{ minikube_ip }}
+          Keycloak: https://{{ keycloak_host }}
+          DNOTAM Provider: https://{{ dnotam_provider_host }}
+          ED-254 Provider: https://{{ ed254_provider_host }}
+      tags: [operator, samples]
+
+    - name: Create Keycloak namespace
+      ansible.builtin.shell: >
+        kubectl create namespace {{ ns_keycloak }} --dry-run=client -o yaml | kubectl apply -f -
+      tags: [operator]
+
+    - name: Create Keycloak realm ConfigMap from external file
+      ansible.builtin.shell: |
+        kubectl create configmap keycloak-realm-config \
+          -n {{ ns_keycloak }} \
+          --from-file=swim-realm.json={{ keycloak_realm_file }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+      tags: [operator]
+
+    - name: Read and apply Keycloak manifest
+      ansible.builtin.shell: |
+        cat {{ keycloak_manifest }} | sed 's/KEYCLOAK_HOST_PLACEHOLDER/{{ keycloak_host }}/g' | kubectl apply -f -
+      args:
+        executable: /bin/bash
+      tags: [operator]
+
+    - name: Create Keycloak TLS Certificate
+      ansible.builtin.shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata:
+          name: keycloak-tls
+          namespace: {{ ns_keycloak }}
+        spec:
+          secretName: keycloak-tls-secret
+          duration: 8760h
+          renewBefore: 720h
+          isCA: false
+          usages:
+            - digital signature
+            - key encipherment
+            - server auth
+            - client auth
+          dnsNames:
+            - {{ keycloak_host }}
+            - keycloak.127.0.0.1.nip.io
+            - keycloak.{{ ns_keycloak }}.svc
+            - keycloak.{{ ns_keycloak }}.svc.cluster.local
+          issuerRef:
+            name: swim-ca-issuer
+            kind: ClusterIssuer
+        EOF
+      args:
+        executable: /bin/bash
+      tags: [operator]
+
+    - name: Wait for Keycloak TLS Certificate
+      ansible.builtin.command: >
+        kubectl wait --for=condition=ready --timeout=60s certificate/keycloak-tls -n {{ ns_keycloak }}
+      retries: 3
+      delay: 5
+      register: keycloak_tls_wait
+      until: keycloak_tls_wait.rc == 0
+      tags: [operator]
+
+    - name: Update Keycloak to use version 26.4
+      ansible.builtin.command: >
+        kubectl set image deployment/keycloak keycloak=quay.io/keycloak/keycloak:26.4 -n {{ ns_keycloak }}
+      tags: [operator]
+
+    - name: Patch Keycloak deployment for HTTPS
+      ansible.builtin.shell: |
+        kubectl patch deployment keycloak -n {{ ns_keycloak }} --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/template/spec/volumes/-",
+            "value": {
+              "name": "tls-secret",
+              "secret": {
+                "secretName": "keycloak-tls-secret"
+              }
+            }
+          },
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/volumeMounts/-",
+            "value": {
+              "name": "tls-secret",
+              "mountPath": "/etc/tls",
+              "readOnly": true
+            }
+          },
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/ports/-",
+            "value": {
+              "name": "https",
+              "containerPort": 8443
+            }
+          },
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/args/-",
+            "value": "--https-certificate-file=/etc/tls/tls.crt"
+          },
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/args/-",
+            "value": "--https-certificate-key-file=/etc/tls/tls.key"
+          },
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/containers/0/readinessProbe/httpGet/scheme",
+            "value": "HTTPS"
+          },
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/containers/0/readinessProbe/httpGet/port",
+            "value": 8443
+          },
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/containers/0/livenessProbe/httpGet/scheme",
+            "value": "HTTPS"
+          },
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/containers/0/livenessProbe/httpGet/port",
+            "value": 8443
+          }
+        ]'
+      args:
+        executable: /bin/bash
+      failed_when: false
+      tags: [operator]
+
+    - name: Update Keycloak Service to expose HTTPS
+      ansible.builtin.shell: |
+        kubectl patch service keycloak -n {{ ns_keycloak }} --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/ports/-",
+            "value": {
+              "name": "https",
+              "port": 8443,
+              "targetPort": 8443
+            }
+          }
+        ]'
+      args:
+        executable: /bin/bash
+      failed_when: false
+      tags: [operator]
+
+    - name: Configure KC_HOSTNAME for internal cluster access
+      ansible.builtin.shell: |
+        kubectl patch deployment keycloak -n {{ ns_keycloak }} --type=json -p='[
+          {
+            "op": "add",
+            "path": "/spec/template/spec/containers/0/env/-",
+            "value": {
+              "name": "KC_HOSTNAME",
+              "value": "keycloak.{{ ns_keycloak }}.svc.cluster.local"
+            }
+          }
+        ]'
+      args:
+        executable: /bin/bash
+      failed_when: false
+      tags: [operator]
+
+    - name: Wait for Keycloak PostgreSQL
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=180s deployment/keycloak-postgres -n {{ ns_keycloak }}
+      retries: 3
+      delay: 10
+      register: keycloak_pg_wait
+      until: keycloak_pg_wait.rc == 0
+      tags: [operator]
+
+    - name: Wait for Keycloak
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=300s deployment/keycloak -n {{ ns_keycloak }}
+      retries: 5
+      delay: 30
+      register: keycloak_wait
+      until: keycloak_wait.rc == 0
+      tags: [operator]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAG: samples
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Create namespaces
+      ansible.builtin.command: "kubectl create namespace {{ item }}"
+      loop:
+        - "{{ ns_dnotam_consumervalidator }}"
+        - "{{ ns_ed254_consumervalidator }}"
+        - "{{ ns_dnotam_backend }}"
+        - "{{ ns_ed254_backend }}"
+        - "{{ ns_providervalidator }}"
+      register: ns_create
+      failed_when: ns_create.rc != 0 and 'already exists' not in ns_create.stderr
+      when: deploy_samples
+      tags: [samples]
+
+    - name: 1/6 Deploy DNOTAM Consumer Validator
+      ansible.builtin.command: kubectl apply -f {{ samples_dir }}/swim-dnotam-consumer-validator-minikube-min.yaml
+      when: deploy_samples
+      tags: [samples]
+
+    - name: Wait for DNOTAM Consumer Validator Artemis
+      ansible.builtin.command: >
+        kubectl wait --for=condition=ready --timeout=300s
+        pod -l ActiveMQArtemis=dnotam-consumer-validator-artemis -n {{ ns_dnotam_consumervalidator }}
+      when: deploy_samples
+      failed_when: false
+      retries: 5
+      delay: 30
+      tags: [samples]
+
+    - name: Wait for DNOTAM Consumer Validator client certificate
+      ansible.builtin.shell: |
+        for i in {1..30}; do
+          if kubectl get secret dnotam-consumer-validator-client-tls -n {{ ns_dnotam_consumervalidator }} &>/dev/null; then
+            exit 0
+          fi
+          sleep 2
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      when: deploy_samples
+      failed_when: false
+      tags: [samples]
+
+    - name: Export DNOTAM Consumer Validator client certificate
+      ansible.builtin.shell: |
+        kubectl get secret dnotam-consumer-validator-client-tls -n {{ ns_dnotam_consumervalidator }} -o jsonpath='{.data.tls\.crt}' | base64 -d > {{ playbook_dir }}/swim-client.crt
+      args:
+        executable: /bin/bash
+      when: deploy_samples
+      tags: [samples]
+
+    - name: Export DNOTAM Consumer Validator client key
+      ansible.builtin.shell: |
+        kubectl get secret dnotam-consumer-validator-client-tls -n {{ ns_dnotam_consumervalidator }} -o jsonpath='{.data.tls\.key}' | base64 -d > {{ playbook_dir }}/swim-client.key
+      args:
+        executable: /bin/bash
+      when: deploy_samples
+      tags: [samples]
+
+    - name: Set client key permissions
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/swim-client.key"
+        mode: '0600'
+      when: deploy_samples
+      tags: [samples]
+
+    - name: Display client certificate location
+      ansible.builtin.debug:
+        msg: |
+          Client certificates exported:
+          - Certificate: {{ playbook_dir }}/swim-client.crt
+          - Private key: {{ playbook_dir }}/swim-client.key
+          Use these for mTLS access to SWIM applications
+      when: deploy_samples
+      tags: [samples]
+
+    - name: 2/6 Deploy ED-254 Consumer Validator
+      ansible.builtin.command: kubectl apply -f {{ samples_dir }}/ed254-consumervalidator.yaml
+      when: deploy_samples
+      failed_when: false
+      tags: [samples]
+
+    - name: 3/6 Deploy DNOTAM Consumer
+      ansible.builtin.command: kubectl apply -f {{ samples_dir }}/swim-dnotam-consumer-minikube-min.yaml
+      when: deploy_samples
+      tags: [samples]
+
+    - name: Wait for DNOTAM Consumer Kafka
+      ansible.builtin.shell: |
+        for i in {1..60}; do
+          STATUS=$(kubectl get kafka kafka -n {{ ns_dnotam_backend }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+          if [ "$STATUS" = "True" ]; then echo "Kafka is ready"; exit 0; fi
+          echo "Waiting for Kafka... ($i/60)"; sleep 5
+        done
+        echo "Timeout waiting for Kafka"; exit 1
+      args:
+        executable: /bin/bash
+      when: deploy_samples
+      failed_when: false
+      async: 360
+      poll: 10
+      tags: [samples]
+
+    - name: 4/6 Deploy ED-254 Consumer
+      ansible.builtin.command: kubectl apply -f {{ samples_dir }}/ed254-consumer.yaml
+      when: deploy_samples
+      failed_when: false
+      tags: [samples]
+
+    - name: 5/6 Deploy DNOTAM Provider
+      ansible.builtin.command: kubectl apply -f {{ samples_dir }}/swim-dnotam-provider-minikube-min.yaml
+      when: deploy_samples
+      tags: [samples]
+
+    - name: Wait for DNOTAM Provider
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=300s deployment/swim-dnotam-provider -n {{ ns_dnotam_backend }}
+      when: deploy_samples
+      failed_when: false
+      retries: 5
+      delay: 30
+      tags: [samples]
+
+    - name: 6/6 Deploy DNOTAM Provider Validator
+      ansible.builtin.command: kubectl apply -f {{ samples_dir }}/swim-dnotam-provider-validator-minikube-min.yaml
+      when: deploy_samples
+      tags: [samples]
+
+    - name: Wait for DNOTAM Provider Validator
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available --timeout=300s deployment/dnotam-provider-validator -n {{ ns_providervalidator }}
+      when: deploy_samples
+      failed_when: false
+      retries: 5
+      delay: 30
+      tags: [samples]
+
+    - name: Remove residual Kafka UI deployments (disabled by kafkaConsoleEnabled=false)
+      ansible.builtin.shell: |
+        for deploy in kafka-ui-console-deployment kafka-ui-prometheus-deployment; do
+          if kubectl get deployment "$deploy" -n {{ ns_dnotam_backend }} &>/dev/null; then
+            kubectl scale deployment "$deploy" -n {{ ns_dnotam_backend }} --replicas=0
+            echo "Scaled down $deploy"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      when: deploy_samples
+      failed_when: false
+      tags: [samples]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Summary
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: Display success message
+      ansible.builtin.debug:
+        msg: |
+          SWIM Local Environment installed successfully.
+
+          Minikube profile: {{ minikube_profile }}
+          Minikube IP: {{ minikube_ip }}
+
+          Installed components:
+          - cert-manager {{ cert_manager_version }}
+          - SWIM PKI (CA: swim-ca-issuer)
+          - Strimzi Kafka Operator
+          - ArtemisCloud Operator
+          - Keycloak (realm: swim)
+          - SWIM Kubernetes Operator
+
+          Access URLs (via nip.io with self-signed TLS):
+          - Keycloak: https://{{ keycloak_host }}
+          {% if deploy_samples %}
+
+          Namespaces:
+          - {{ ns_keycloak }} (Keycloak)
+          - {{ ns_dnotam_consumervalidator }} (DNOTAM Consumer Validator)
+          - {{ ns_ed254_consumervalidator }} (ED-254 Consumer Validator)
+          - {{ ns_dnotam_backend }} (DNOTAM Consumer + Provider + Kafka)
+          - {{ ns_ed254_backend }} (ED-254 Consumer + Kafka)
+          - {{ ns_providervalidator }} (Provider Validator UI)
+
+          Verify pods:
+            kubectl get pods -n {{ ns_dnotam_consumervalidator }}
+            kubectl get pods -n {{ ns_ed254_consumervalidator }}
+            kubectl get pods -n {{ ns_dnotam_backend }}
+            kubectl get pods -n {{ ns_ed254_backend }}
+          {% endif %}
+
+          TLS/HTTPS Configuration:
+          - All services use HTTPS with certificates signed by SWIM CA
+          - CA certificate exported to: {{ playbook_dir }}/swim-ca.crt
+          {% if deploy_samples %}
+          - Client certificate: {{ playbook_dir }}/swim-client.crt
+          - Client key: {{ playbook_dir }}/swim-client.key
+          {% endif %}
+          - Keycloak TLS: https://{{ keycloak_host }}:8443
+
+          Import SWIM CA in your browser/system for trusted HTTPS:
+
+          macOS:
+            sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {{ playbook_dir }}/swim-ca.crt
+
+          Linux:
+            sudo cp {{ playbook_dir }}/swim-ca.crt /usr/local/share/ca-certificates/
+            sudo update-ca-certificates
+
+          Windows:
+            certutil -addstore -f "ROOT" {{ playbook_dir }}/swim-ca.crt
+
+          Browser (Firefox):
+            Preferences → Privacy & Security → Certificates → View Certificates → Import
+          {% if deploy_samples %}
+
+          Access SWIM applications with mTLS (using client certificate):
+            curl https://{{ ns_dnotam_consumervalidator }}.{{ ns_dnotam_consumervalidator }}.svc.cluster.local/q/health \
+              --cacert {{ playbook_dir }}/swim-ca.crt \
+              --cert {{ playbook_dir }}/swim-client.crt \
+              --key {{ playbook_dir }}/swim-client.key
+
+          Note: SWIM applications require mTLS (mutual TLS) for external access.
+          Pods inside the cluster use mounted secrets for automatic certificate injection.
+          {% endif %}
+
+          PKI Info:
+          - CA Secret: swim-ca-secret (namespace: cert-manager)
+          - ClusterIssuer: swim-ca-issuer
+          - Certificates auto-renew 30 days before expiration
+
+          Available tags: minikube, dependencies, operator, samples, cleanup, restart
+          Run specific phase: ansible-playbook swim-local-setup.yml --tags dependencies
