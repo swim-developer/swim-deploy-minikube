@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help setup setup-samples destroy cluster-only
+.PHONY: help sync pull setup setup-samples destroy cluster-only
 
 help:
 	@echo "Targets:"
@@ -11,6 +11,14 @@ help:
 	@echo ""
 	@echo "Build local images before deploying:"
 	@echo "  make setup-samples BUILD_OPERATOR=true BUILD_APPS=true"
+	@echo ""
+	@echo "  sync          Pull this project from remote (git pull --ff-only)"
+	@echo "  pull          Pull this project from remote (git pull --ff-only)"
+
+sync: pull
+
+pull:
+	@git pull --ff-only
 
 BUILD_OPERATOR ?= false
 BUILD_APPS     ?= false
