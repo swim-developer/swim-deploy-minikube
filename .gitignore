@@ -8,7 +8,6 @@ swim-ca.crt
 *.tmp
 
 # AI tools
-CLAUDE.md
 .claude/
 .cursor/
 .copilot/
