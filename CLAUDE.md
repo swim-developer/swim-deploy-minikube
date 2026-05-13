@@ -99,7 +99,3 @@ Every artifact name must be unambiguous and fully qualified. Use `swim-dnotam-co
 
 Ansible/kubectl/helm commands that modify a running cluster require explicit user confirmation before execution. Read-only commands (`kubectl get`, `kubectl describe`, `kubectl logs`) are allowed without confirmation.
 
-### AI Authorship
-
-Never add `Co-Authored-By` or any AI tool reference to commit messages. A global git hook at `~/.config/git/hooks/commit-msg` strips these automatically.
-
